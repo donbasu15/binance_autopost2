@@ -1,0 +1,13 @@
+.env
+*.log
+# Compiled Python bytecode
+__pycache__/
+*.pyc
+# Virtual environment
+.venv/
+venv/
+ENV/
+# Distribution folder (created by PyInstaller)
+dist/
+build/
+*.spec
