@@ -6,7 +6,7 @@ services:
     startCommand: gunicorn bipi:app --workers 1 --threads 4 --bind 0.0.0.0:$PORT
     envVars:
       - key: PORT
-        value: "10000"
+        value: "5000"
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_API_KEY_2

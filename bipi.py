@@ -385,13 +385,22 @@ class DataPipeline:
             "User-Agent": "BinanceSquarePoster/2.0"
         })
 
-    def _get(self, url: str, params: dict = None, timeout: int = 4) -> dict | list | None:
+    # def _get(self, url: str, params: dict = None, timeout: int = 4) -> dict | list | None:
+    #     try:
+    #         r = self.session.get(url, params=params, timeout=timeout)
+    #         r.raise_for_status()
+    #         return r.json()
+    #     except Exception as e:
+    #         log.warning(f"  ⚠ Fetch failed [{url[:60]}]: {e}")
+    #         return None
+    def _get(self, url, params=None, timeout=4):
         try:
-            r = self.session.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
+           r = self.session.get(url, params=params, timeout=timeout)
+           log.info(f"URL={url} STATUS={r.status_code}")
+           r.raise_for_status()
+           return r.json()
         except Exception as e:
-            log.warning(f"  ⚠ Fetch failed [{url[:60]}]: {e}")
+            log.exception(f"FETCH FAILED: {url}")
             return None
 
     # ── Binance klines (OHLCV) — free, no auth ──
@@ -1206,17 +1215,6 @@ def trigger_single_post():
     coin = analysis["coin"]
     log.info(f"🎯 Manual Signal: [{post_type}] on {coin['tag']}")
     
-    # Fetch OI and funding for the selected coin on-demand
-    try:
-        oi_obj = global_pipeline.fetch_open_interest(coin["fsym"])
-        if oi_obj:
-            global_data["oi"] = {coin["sym"]: oi_obj}
-        fr_val = global_pipeline.fetch_funding_rate(coin["fsym"])
-        if fr_val is not None:
-            global_data["funding"] = {coin["sym"]: fr_val}
-    except Exception as e:
-        log.warning(f"  ⚠ Failed to fetch on-demand Futures data for {coin['tag']}: {e}")
-    
     # 3. Generate text using rotator
     coin_news = global_pipeline.fetch_news(currency=coin["cp"])
     all_news = news + [n for n in coin_news if n not in news]
@@ -1354,17 +1352,6 @@ def run_daily_session():
         coin = analysis["coin"]
         log.info(f"🎯 Signal: [{post_type}] on {coin['tag']} (RSI={analysis['rsi']}, MACD={analysis['macd']['crossover']})")
         
-        # Fetch OI and funding for the selected coin on-demand
-        try:
-            oi_obj = global_pipeline.fetch_open_interest(coin["fsym"])
-            if oi_obj:
-                global_data["oi"] = {coin["sym"]: oi_obj}
-            fr_val = global_pipeline.fetch_funding_rate(coin["fsym"])
-            if fr_val is not None:
-                global_data["funding"] = {coin["sym"]: fr_val}
-        except Exception as e:
-            log.warning(f"  ⚠ Failed to fetch on-demand Futures data for {coin['tag']}: {e}")
-        
         with state_lock:
             bot_state["schedule"][idx]["coin"] = coin["tag"]
             bot_state["schedule"][idx]["type"] = post_type
@@ -1493,14 +1480,29 @@ def _refresh_global(pipeline: DataPipeline) -> dict:
     fg       = pipeline.fetch_fear_greed()
     trending = pipeline.fetch_trending()
 
-    log.info(f"  🌐 Global data: {len(market) if market else 0} coins | F&G={fg['value']} ({fg['label']}) "
-             f"| Trending: {trending[:3] if trending else []}")
+    # Fetch OI and funding for top coins
+    oi_data      = {}
+    funding_data = {}
+    for coin in COINS[:8]:   # top 8 only to avoid rate limits
+        try:
+            oi = pipeline.fetch_open_interest(coin["fsym"])
+            if oi:
+                oi_data[coin["sym"]] = oi
+            fr = pipeline.fetch_funding_rate(coin["fsym"])
+            if fr is not None:
+                funding_data[coin["sym"]] = fr
+            time.sleep(0.1)
+        except:
+            pass
+
+    log.info(f"  🌐 Global data: {len(market)} coins | F&G={fg['value']} ({fg['label']}) "
+             f"| Trending: {trending[:3]}")
     return {
-        "market":     market or {},
+        "market":     market,
         "fg":         fg,
-        "trending":   trending or [],
-        "oi":         {},
-        "funding":    {},
+        "trending":   trending,
+        "oi":         oi_data,
+        "funding":    funding_data,
         "fetched_at": datetime.utcnow().strftime("%H:%M UTC"),
     }
 
