@@ -126,7 +126,8 @@ BINANCE_SQUARE_KEY    = os.getenv("BINANCE_SQUARE_KEY")
 CRYPTOPANIC_KEY       = os.getenv("CRYPTOPANIC_KEY", "")
 
 BINANCE_POST_URL      = "https://www.binance.com/bapi/composite/v1/public/pgc/openApi/content/add"
-BINANCE_UPLOAD_URL    = "https://www.binance.com/bapi/composite/v1/public/pgc/openApi/media/upload/token"
+BINANCE_UPLOAD_URL    = "https://www.binance.com/bapi/composite/v2/public/pgc/openApi/image/presignedUrl"
+BINANCE_STATUS_URL    = "https://www.binance.com/bapi/composite/v2/public/pgc/openApi/image/imageStatus"
 BINANCE_KLINES_URL    = "https://api.binance.com/api/v3/klines"
 BINANCE_FUTURES_OI    = "https://fapi.binance.com/fapi/v1/openInterest"
 BINANCE_FUNDING_URL   = "https://fapi.binance.com/fapi/v1/fundingRate"
@@ -863,27 +864,25 @@ class ImageUploader:
                 "clienttype": "web"}
 
     def upload(self, image_bytes: bytes) -> str | None:
-        # Step 1: get presigned upload token
+        # Step 1: get presigned URL & file ticket
         try:
             r = requests.post(BINANCE_UPLOAD_URL,
                               headers=self._headers(),
-                              json={"fileSize": len(image_bytes),
-                                    "mediaType": "image/png",
-                                    "bizType": 1},
+                              json={"imageName": "chart.png"},
                               timeout=15)
             data = r.json()
             if data.get("code") != "000000":
-                log.warning(f"  Upload token failed: {data.get('message')}")
+                log.warning(f"  Upload presigned URL failed: {data.get('message')}")
                 return None
-            token    = data.get("data", {})
-            put_url  = token.get("uploadUrl") or token.get("presignedUrl")
-            cdn_url  = token.get("mediaUrl")  or token.get("url")
+            res_data = data.get("data", {})
+            put_url = res_data.get("presignedUrl")
+            file_ticket = res_data.get("fileTicket")
         except Exception as e:
             log.warning(f"  Upload token error: {e}")
             return None
 
-        if not put_url:
-            log.warning(f"  No presigned URL in response: {token}")
+        if not put_url or not file_ticket:
+            log.warning(f"  Missing presigned URL or file ticket: {res_data}")
             return None
 
         # Step 2: PUT image to presigned URL
@@ -898,8 +897,31 @@ class ImageUploader:
             log.warning(f"  Image PUT error: {e}")
             return None
 
-        time.sleep(1.5)  # let Binance process
-        log.info(f"  🖼  Image uploaded → {(cdn_url or '')[:55]}...")
+        # Step 3: Poll imageStatus until public CDN URL is generated
+        cdn_url = None
+        try:
+            for attempt in range(1, 11):
+                time.sleep(1.5)
+                r_st = requests.post(BINANCE_STATUS_URL,
+                                     headers=self._headers(),
+                                     json={"fileTicket": file_ticket},
+                                     timeout=10)
+                data_st = r_st.json().get("data", {})
+                if data_st and data_st.get("imageUrl"):
+                    cdn_url = data_st.get("imageUrl")
+                    break
+                if data_st and data_st.get("status") == 2:
+                    log.warning(f"  Image processing failed on backend: {data_st.get('failedReason')}")
+                    return None
+        except Exception as e:
+            log.warning(f"  Image status polling error: {e}")
+            return None
+
+        if not cdn_url:
+            log.warning("  Timeout waiting for public image URL from Binance status endpoint")
+            return None
+
+        log.info(f"  🖼  Image uploaded → {cdn_url[:55]}...")
         return cdn_url
 
 
@@ -1167,77 +1189,163 @@ class SignalSelector:
         """
         Returns (analysis, post_type) or None.
         Strategy:
-          1. If fresh news (<30 min) and breakout_news underused → use it
-          2. Scan coins for strongest TA signal
-          3. If no strong signal → fall back to weighted random from mix
+          1. Select a target post_type from POST_MIX using weighted random choices based on current deficits.
+          2. Scan the coin pool on-demand, caching analyses, to find a coin satisfying that type's criteria.
+          3. Fall back to any coin with an active TA signal if target is not met.
+          4. Absolute fallback to educational, price_target, or market_vibe on a random coin.
         """
-        # Fresh news priority
-        breaking = [n for n in news if n["age_min"] < 30]
-        if breaking and self._type_count.get("breakout_news", 0) < 8:
-            # Find a coin mentioned in the news or use BTC/ETH
-            coin = random.choice([c for c in COINS if c["tag"] in ("$BTC","$ETH")])
-            a    = self.pipeline.analyse_coin(coin)
-            if a:
-                return a, "breakout_news"
+        # 1. Helper to get current counts mapped to POST_MIX keys (e.g. aggregate macd_signal_bull/bear)
+        def get_current_counts():
+            counts = {}
+            for k in POST_MIX:
+                if k == "macd_signal":
+                    counts[k] = self._type_count.get("macd_signal_bull", 0) + \
+                                self._type_count.get("macd_signal_bear", 0)
+                else:
+                    counts[k] = self._type_count.get(k, 0)
+            return counts
 
-        # Greed/fear override
-        fg_val = global_data["fg"].get("value", 50)
-        if isinstance(fg_val, int):
-            if fg_val >= 80 and self._type_count.get("greed_warning", 0) < 3:
-                coin = random.choice(COINS[:4])
-                a    = self.pipeline.analyse_coin(coin)
-                if a:
-                    return a, "greed_warning"
-            if fg_val <= 25 and self._type_count.get("oversold_alert", 0) < 4:
-                coin = random.choice(COINS[:4])
-                a    = self.pipeline.analyse_coin(coin)
-                if a:
-                    return a, "oversold_alert"
+        # 2. Calculate remaining deficits for each post type
+        counts = get_current_counts()
+        deficits = {k: max(0, POST_MIX[k] - counts[k]) for k in POST_MIX}
+        
+        # 3. Choose a target post type weighted by remaining deficits
+        eligible_types = [k for k, v in deficits.items() if v > 0]
+        if not eligible_types:
+            eligible_types = list(POST_MIX.keys())
+            weights = [POST_MIX[k] for k in eligible_types]
+        else:
+            weights = [deficits[k] for k in eligible_types]
 
-        # Scan up to 6 random coins for TA signals
-        candidates = []
+        target_type = random.choices(eligible_types, weights=weights, k=1)[0]
+        log.info(f"🎲 Selected target post type: {target_type} (deficit weight: {deficits.get(target_type, 0)})")
+
+        # 4. Prepare coin pool (shuffle and exclude recent coins to keep variety)
         pool = [c for c in COINS if c["tag"] not in recent_coins[-3:]]
         random.shuffle(pool)
-        for coin in pool[:6]:
-            a = self.pipeline.analyse_coin(coin)
-            if a:
-                sig = a["signal"]
-                # Map TA signal → post type
-                post_type = {
-                    "oversold_alert":    "oversold_alert",
-                    "overbought_warn":   "overbought_warn",
-                    "macd_signal_bull":  "macd_signal_bull",
-                    "macd_signal_bear":  "macd_signal_bear",
-                    "bollinger_squeeze": "bollinger_squeeze",
-                    "volume_alert":      "volume_alert",
-                    "market_vibe":       "market_vibe",
-                }.get(sig, "market_vibe")
 
-                # Score: prefer under-used types + stronger signals
-                type_deficit = POST_MIX.get(post_type, 5) - self._type_count.get(post_type, 0)
-                signal_score = {
-                    "oversold_alert": 10 if a["rsi"] < 25 else 7,
-                    "overbought_warn": 10 if a["rsi"] > 75 else 7,
-                    "macd_signal_bull": 9, "macd_signal_bear": 9,
-                    "bollinger_squeeze": 8, "volume_alert": 7,
-                    "market_vibe": 3,
-                }.get(post_type, 3)
-                score = type_deficit * 2 + signal_score
-                candidates.append((a, post_type, score))
+        # On-demand analysis cache to prevent redundant API calls
+        analyses = {}
+        def get_analysis(coin):
+            tag = coin["tag"]
+            if tag not in analyses:
+                analyses[tag] = self.pipeline.analyse_coin(coin)
+            return analyses[tag]
 
-        if candidates:
-            candidates.sort(key=lambda x: x[2], reverse=True)
-            a, post_type, _ = candidates[0]
-            self._type_count[post_type] = self._type_count.get(post_type, 0) + 1
-            return a, post_type
+        # Helper to find first coin satisfying a specific TA condition
+        def find_coin_for_signal(condition_fn):
+            for coin in pool:
+                a = get_analysis(coin)
+                if a and condition_fn(a):
+                    return a
+            return None
 
-        # Fallback: educational or price_target on any coin
-        coin = random.choice([c for c in COINS if c["tag"] not in recent_coins[-3:]])
-        a    = self.pipeline.analyse_coin(coin)
-        fallback_type = random.choice(["educational", "price_target", "market_vibe"])
-        if a:
-            self._type_count[fallback_type] = self._type_count.get(fallback_type, 0) + 1
-            return a, fallback_type
+        # 5. Try to satisfy the chosen target_type
+        a_selected = None
+        final_type = target_type
+
+        if target_type == "oversold_alert":
+            a_selected = find_coin_for_signal(lambda x: x["rsi"] < 30 or x["bollinger"]["pct_b"] < 0.1)
+
+        elif target_type == "overbought_warn":
+            a_selected = find_coin_for_signal(lambda x: x["rsi"] > 70 or x["bollinger"]["pct_b"] > 0.9)
+
+        elif target_type == "macd_signal":
+            a_selected = find_coin_for_signal(lambda x: x["macd"]["crossover"] in ("bullish", "bearish"))
+            if a_selected:
+                final_type = "macd_signal_bull" if a_selected["macd"]["crossover"] == "bullish" else "macd_signal_bear"
+
+        elif target_type == "bollinger_squeeze":
+            a_selected = find_coin_for_signal(lambda x: x["bollinger"]["squeeze"])
+
+        elif target_type == "volume_alert":
+            a_selected = find_coin_for_signal(lambda x: x["vol_trend"]["trend"] == "spike")
+
+        elif target_type == "breakout_news":
+            breaking = [n for n in news if n["age_min"] < 120]
+            if breaking:
+                # Try to find a coin mentioned in news
+                for n in breaking:
+                    for coin in pool:
+                        if coin["tag"].lower() in n["title"].lower() or coin["cp"].lower() in n["title"].lower():
+                            a = get_analysis(coin)
+                            if a:
+                                a_selected = a
+                                break
+                    if a_selected:
+                        break
+                # Fallback to BTC/ETH if no news mention matching
+                if not a_selected:
+                    for tag in ("$BTC", "$ETH"):
+                        match_coin = next((c for c in pool if c["tag"] == tag), None)
+                        if match_coin:
+                            a = get_analysis(match_coin)
+                            if a:
+                                a_selected = a
+                                break
+
+        elif target_type == "whale_oi_watch":
+            for coin in pool:
+                has_oi = "oi" in global_data and coin["sym"] in global_data["oi"]
+                has_funding = "funding" in global_data and coin["sym"] in global_data["funding"]
+                if has_oi or has_funding:
+                    a = get_analysis(coin)
+                    if a:
+                        a_selected = a
+                        break
+
+        elif target_type == "greed_warning":
+            for tag in ("$BTC", "$ETH", "$BNB", "$SOL"):
+                match_coin = next((c for c in pool if c["tag"] == tag), None)
+                if match_coin:
+                    a = get_analysis(match_coin)
+                    if a:
+                        a_selected = a
+                        break
+
+        elif target_type in ("price_target", "market_vibe", "educational"):
+            # Can run on any analyzed coin
+            for coin in pool:
+                a = get_analysis(coin)
+                if a:
+                    a_selected = a
+                    break
+
+        # 6. Fallback: if we couldn't satisfy target_type, find ANY coin with an active TA signal
+        if not a_selected:
+            log.info(f"⚠️ Could not satisfy target type '{target_type}'. Scanning for any active signal...")
+            for coin in pool:
+                a = get_analysis(coin)
+                if a:
+                    sig = a["signal"]
+                    mapped_type = {
+                        "oversold_alert":    "oversold_alert",
+                        "overbought_warn":   "overbought_warn",
+                        "macd_signal_bull":  "macd_signal_bull",
+                        "macd_signal_bear":  "macd_signal_bear",
+                        "bollinger_squeeze": "bollinger_squeeze",
+                        "volume_alert":      "volume_alert",
+                    }.get(sig)
+                    if mapped_type:
+                        a_selected = a
+                        final_type = mapped_type
+                        log.info(f"✨ Fallback to active TA signal '{final_type}' on {coin['tag']}")
+                        break
+
+        # 7. Absolute fallback: pick any analyzed coin and choose a general type
+        if not a_selected:
+            for coin in pool:
+                a = get_analysis(coin)
+                if a:
+                    a_selected = a
+                    final_type = random.choice(["market_vibe", "price_target", "educational"])
+                    log.info(f"✨ Absolute fallback to '{final_type}' on {coin['tag']}")
+                    break
+
+        if a_selected:
+            self._type_count[final_type] = self._type_count.get(final_type, 0) + 1
+            return a_selected, final_type
+
         return None
 
 
