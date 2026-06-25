@@ -1027,7 +1027,7 @@ def generate_post(client: genai.Client, post_type: str, analysis: dict,
             system_instruction=SYSTEM_PROMPT,
             temperature=0.95,
             top_p=0.95,
-            max_output_tokens=3000,
+            max_output_tokens=2000,
         )
     )
     return resp.text.strip()
@@ -1519,6 +1519,22 @@ def _print_summary(selector: SignalSelector):
 # FLASK WEB APP & EMBEDDED DASHBOARD
 # ─────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
+
+scheduler_started = False
+scheduler_lock = threading.Lock()
+
+@app.before_request
+def start_scheduler_on_first_request():
+    global scheduler_started
+    if not scheduler_started:
+        with scheduler_lock:
+            if not scheduler_started:
+                try:
+                    start_background_thread()
+                    scheduler_started = True
+                    log.info("Background scheduler thread started via before_request in worker process.")
+                except Exception as e:
+                    log.error(f"Failed to start background thread: {e}")
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -2413,9 +2429,9 @@ import sys
 if "--cli" not in sys.argv:
     try:
         init_globals()
-        start_background_thread()
+        # Defer start_background_thread() to app.before_request to ensure it runs inside the Gunicorn worker process.
     except Exception as e:
-        log.warning(f"Could not auto-start background thread on import: {e}. "
+        log.warning(f"Could not auto-initialize globals on import: {e}. "
                     "Make sure environment variables are set before starting the server.")
 
 # ─────────────────────────────────────────────────────────────────────────────
