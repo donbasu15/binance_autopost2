@@ -1128,7 +1128,7 @@ def generate_post(client: genai.Client, post_type: str, analysis: dict,
             system_instruction=SYSTEM_PROMPT,
             temperature=0.95,
             top_p=0.95,
-            max_output_tokens=2000,
+            max_output_tokens=3000,
         )
     )
     return resp.text.strip()
