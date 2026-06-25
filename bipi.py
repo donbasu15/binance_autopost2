@@ -57,6 +57,8 @@ bot_state = {
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
+from logging.handlers import RotatingFileHandler
+
 class MemoryLogHandler(logging.Handler):
     def __init__(self, log_list, max_logs=50):
         super().__init__()
@@ -76,15 +78,29 @@ class MemoryLogHandler(logging.Handler):
 mem_handler = MemoryLogHandler(bot_state["logs"])
 mem_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 
+# Configure log rotation (max 5MB per file, keeping 3 backups)
+rotating_handler = RotatingFileHandler(
+    "autoposter.log", 
+    maxBytes=5 * 1024 * 1024, 
+    backupCount=3,
+    encoding="utf-8"
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("autoposter.log"),
+        rotating_handler,
         logging.StreamHandler(),
         mem_handler
     ]
 )
+
+# Silence the extremely noisy Flask (werkzeug), urllib3, and HTTP client (httpx) logs
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,7 +132,7 @@ BINANCE_FUTURES_OI    = "https://fapi.binance.com/fapi/v1/openInterest"
 BINANCE_FUNDING_URL   = "https://fapi.binance.com/fapi/v1/fundingRate"
 COINGECKO_URL         = "https://api.coingecko.com/api/v3"
 FEAR_GREED_URL        = "https://api.alternative.me/fng/"
-CRYPTOPANIC_URL       = "https://cryptopanic.com/api/free/v1/posts/"
+CRYPTOPANIC_URL       = "https://cryptopanic.com/api/developer/v2/posts/"
 
 POSTS_PER_DAY_MIN     = 40
 POSTS_PER_DAY_MAX     = 50
@@ -399,8 +415,14 @@ class DataPipeline:
            log.info(f"URL={url} STATUS={r.status_code}")
            r.raise_for_status()
            return r.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                log.warning(f"⚠️ Rate limited (429) on: {url}")
+            else:
+                log.warning(f"⚠️ Fetch failed: {url} | Status: {e.response.status_code if e.response is not None else 'unknown'}")
+            return None
         except Exception as e:
-            log.exception(f"FETCH FAILED: {url}")
+            log.warning(f"⚠️ Fetch error: {url} | {e}")
             return None
 
     # ── Binance klines (OHLCV) — free, no auth ──
@@ -469,29 +491,108 @@ class DataPipeline:
             return None
         return float(data[0].get("fundingRate", 0))
 
-    # ── CryptoPanic: news (free key) ──
+    # ── CryptoNews: RSS (Free) / CryptoPanic (Paid) ──
     def fetch_news(self, currency: str = None) -> list[dict]:
-        if not self.cp_key:
-            return []
-        params = {"auth_token": self.cp_key, "public": "true",
-                  "filter": "hot", "kind": "news"}
-        if currency:
-            params["currencies"] = currency
-        data = self._get(CRYPTOPANIC_URL, params=params)
-        if not data or "results" not in data:
-            return []
-        now = datetime.utcnow()
         results = []
-        for item in data["results"][:10]:
-            title     = item.get("title","").strip()
-            published = item.get("published_at","")
+        now = datetime.utcnow()
+        
+        # 1. Attempt CryptoPanic if a key is provided
+        if self.cp_key:
             try:
-                pub_dt  = datetime.strptime(published[:19], "%Y-%m-%dT%H:%M:%S")
-                age_min = int((now - pub_dt).total_seconds() / 60)
-            except:
-                age_min = 9999
-            results.append({"title": title, "age_min": age_min})
-        return sorted(results, key=lambda x: x["age_min"])
+                params = {"auth_token": self.cp_key, "public": "true",
+                          "filter": "hot", "kind": "news"}
+                if currency:
+                    params["currencies"] = currency
+                data = self._get(CRYPTOPANIC_URL, params=params)
+                if data and "results" in data:
+                    for item in data["results"][:10]:
+                        title     = item.get("title","").strip()
+                        published = item.get("published_at","")
+                        pub_time  = "N/A"
+                        try:
+                            pub_dt  = datetime.strptime(published[:19], "%Y-%m-%dT%H:%M:%S")
+                            age_min = int((now - pub_dt).total_seconds() / 60)
+                            pub_time = pub_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                        except:
+                            age_min = 9999
+                        results.append({"title": title, "age_min": age_min, "time": pub_time})
+            except Exception as e:
+                log.warning(f"⚠️ CryptoPanic API fetch failed: {e}")
+
+        # 2. Add free public RSS and Atom feeds (aggregates from CoinTelegraph, CoinDesk, Decrypt, Blockworks)
+        import xml.etree.ElementTree as ET
+        feeds = [
+            "https://cointelegraph.com/rss",
+            "https://www.coindesk.com/arc/outboundfeeds/rss/",
+            "https://decrypt.co/feed",
+            "https://blockworks.co/feed"
+        ]
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        for url in feeds:
+            try:
+                r = self.session.get(url, headers=headers, timeout=5)
+                if r.status_code != 200:
+                    continue
+                root = ET.fromstring(r.content)
+                
+                # Namespace-agnostic element extraction
+                elements = []
+                for el in root.iter():
+                    tag_local = el.tag.split("}")[-1]
+                    if tag_local in ("item", "entry"):
+                        elements.append(el)
+                        
+                for el in elements[:10]:
+                    title_text = ""
+                    pub_date_text = ""
+                    
+                    for child in el:
+                        child_tag = child.tag.split("}")[-1]
+                        if child_tag == "title":
+                            title_text = child.text.strip() if child.text else ""
+                        elif child_tag in ("pubDate", "published", "updated"):
+                            pub_date_text = child.text.strip() if child.text else ""
+                            
+                    # Filter by currency if specified
+                    if currency and currency.upper() not in title_text.upper():
+                        continue
+                        
+                    age_min = 9999
+                    pub_time = "N/A"
+                    if pub_date_text:
+                        if "T" in pub_date_text:
+                            try:
+                                pub_dt = datetime.strptime(pub_date_text[:19], "%Y-%m-%dT%H:%M:%S")
+                                age_min = int((now - pub_dt).total_seconds() / 60)
+                                pub_time = pub_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                            except:
+                                pass
+                        else:
+                            try:
+                                dt_str = pub_date_text.replace("GMT", "").replace("UTC", "").split("+")[0].split("-")[0].strip()
+                                pub_dt = datetime.strptime(dt_str, "%a, %d %b %Y %H:%M:%S")
+                                age_min = int((now - pub_dt).total_seconds() / 60)
+                                pub_time = pub_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                            except:
+                                pass
+                                
+                    if title_text:
+                        results.append({"title": title_text, "age_min": age_min, "time": pub_time})
+            except Exception as e:
+                log.warning(f"⚠️ Failed to parse RSS feed {url}: {e}")
+                
+        # Sort by age_min so that the latest news is always at the top
+        results = sorted(results, key=lambda x: x["age_min"])
+        
+        # Log success and the latest items to console
+        if results:
+            log.info(f"📰 Successfully fetched {len(results)} news items. Latest articles:")
+            for item in results[:3]:
+                log.info(f"   • [{item['time']} / {item['age_min']}m ago] {item['title']}")
+        else:
+            log.warning("⚠️ No news items could be fetched from any feeds.")
+            
+        return results[:15]
 
     # ── Trending coins (CoinGecko) ──
     def fetch_trending(self) -> list[str]:
