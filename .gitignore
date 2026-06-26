@@ -11,3 +11,4 @@ ENV/
 dist/
 build/
 *.spec
+.news_state.json

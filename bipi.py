@@ -19,7 +19,7 @@ Requirements:
     CRYPTOPANIC_KEY=your_free_key     # optional but recommended
 """
 
-import os, io, time, random, logging, math, json, threading
+import os, io, time, random, logging, math, json, threading, re
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -53,6 +53,36 @@ bot_state = {
     "is_running": True,
     "error_message": None,
 }
+
+NEWS_STATE_FILE = "/home/don-basumatary/Desktop/BiPass2/.news_state.json"
+
+def load_news_state() -> tuple[datetime | None, list[str]]:
+    try:
+        if os.path.exists(NEWS_STATE_FILE):
+            with open(NEWS_STATE_FILE, "r") as f:
+                data = json.load(f)
+                val_time = data.get("last_posted_news_time")
+                dt = datetime.fromisoformat(val_time) if val_time else None
+                titles = data.get("posted_titles", [])
+                return dt, titles
+    except Exception as e:
+        print("Failed to load news state:", e)
+    return None, []
+
+def save_news_state(dt: datetime | None, titles: list[str]):
+    try:
+        with open(NEWS_STATE_FILE, "w") as f:
+            json.dump({
+                "last_posted_news_time": dt.isoformat() if dt else None,
+                "posted_titles": titles
+            }, f)
+    except Exception as e:
+        print("Failed to save news state:", e)
+
+last_posted_news_time, posted_news_titles = load_news_state()
+news_lock = threading.Lock()
+news_cancel_event = threading.Event()
+news_schedule_thread = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -135,24 +165,18 @@ COINGECKO_URL         = "https://api.coingecko.com/api/v3"
 FEAR_GREED_URL        = "https://api.alternative.me/fng/"
 CRYPTOPANIC_URL       = "https://cryptopanic.com/api/developer/v2/posts/"
 
-POSTS_PER_DAY_MIN     = 40
-POSTS_PER_DAY_MAX     = 50
+POSTS_PER_DAY_MIN     = 10
+POSTS_PER_DAY_MAX     = 10
 DATA_REFRESH_EVERY    = 5       # refresh global data every N posts
 CHART_PROBABILITY     = 0.70    # 70% of posts get a chart image
 
 # Post-type target mix per day (weights, must sum to ~100)
 POST_MIX = {
-    "oversold_alert":    10,
-    "overbought_warn":   10,
-    "macd_signal":       12,
-    "bollinger_squeeze": 8,
-    "breakout_news":     15,
-    "whale_oi_watch":    8,
-    "greed_warning":     7,
-    "volume_alert":      8,
-    "price_target":      8,
-    "market_vibe":       7,
-    "educational":       7,
+    "oversold_alert":    20,
+    "overbought_warn":   20,
+    "macd_signal":       20,
+    "bollinger_squeeze": 20,
+    "volume_alert":      20,
 }
 
 INTERVAL_BANDS   = [(45,300),(300,900),(900,2700),(2700,5400),(5400,10800)]
@@ -392,6 +416,48 @@ def fmt_large(n) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
+def parse_scraped_date(pub_str: str) -> datetime:
+    """
+    Parse Javascript, ISO, and standard HTTP/RSS date strings into UTC datetime.
+    """
+    now = datetime.utcnow()
+    if not pub_str:
+        return now
+    pub_str = pub_str.strip()
+    
+    # ISO formats (e.g. 2026-06-11T17:15:19.000Z or 2026-06-11T17:15:19Z)
+    if "T" in pub_str:
+        try:
+            t_part = pub_str.split(".")[0].replace("Z", "")
+            return datetime.strptime(t_part[:19], "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            pass
+
+    # Javascript format (e.g. Thu Jun 11 2026 17:15:19 GMT+0530 (India Standard Time))
+    if "GMT" in pub_str:
+        try:
+            parts = pub_str.split(" GMT")
+            dt_part = parts[0].strip()
+            dt = datetime.strptime(dt_part, "%a %b %d %Y %H:%M:%S")
+            offset_str = parts[1].split("(")[0].strip()
+            if len(offset_str) >= 5 and offset_str[0] in ("+", "-"):
+                sign = 1 if offset_str[0] == "+" else -1
+                hours = int(offset_str[1:3])
+                minutes = int(offset_str[3:5])
+                dt -= timedelta(hours=sign*hours, minutes=sign*minutes)
+            return dt
+        except Exception:
+            pass
+            
+    # Standard RSS / HTTP header formats (e.g. Thu, 11 Jun 2026 17:15:19 GMT)
+    try:
+        dt_clean = pub_str.replace("GMT", "").replace("UTC", "").split("+")[0].split("-")[0].strip()
+        return datetime.strptime(dt_clean, "%a, %d %b %Y %H:%M:%S")
+    except Exception:
+        pass
+
+    return now
+
 
 class DataPipeline:
     def __init__(self, cryptopanic_key: str = ""):
@@ -401,6 +467,8 @@ class DataPipeline:
             "Accept": "application/json",
             "User-Agent": "BinanceSquarePoster/2.0"
         })
+        self.pushed_news = []
+        self.pushed_news_lock = threading.Lock()
 
     # def _get(self, url: str, params: dict = None, timeout: int = 4) -> dict | list | None:
     #     try:
@@ -492,106 +560,37 @@ class DataPipeline:
             return None
         return float(data[0].get("fundingRate", 0))
 
-    # ── CryptoNews: RSS (Free) / CryptoPanic (Paid) ──
     def fetch_news(self, currency: str = None) -> list[dict]:
         results = []
         now = datetime.utcnow()
         
-        # 1. Attempt CryptoPanic if a key is provided
-        if self.cp_key:
-            try:
-                params = {"auth_token": self.cp_key, "public": "true",
-                          "filter": "hot", "kind": "news"}
-                if currency:
-                    params["currencies"] = currency
-                data = self._get(CRYPTOPANIC_URL, params=params)
-                if data and "results" in data:
-                    for item in data["results"][:10]:
-                        title     = item.get("title","").strip()
-                        published = item.get("published_at","")
-                        pub_time  = "N/A"
-                        try:
-                            pub_dt  = datetime.strptime(published[:19], "%Y-%m-%dT%H:%M:%S")
-                            age_min = int((now - pub_dt).total_seconds() / 60)
-                            pub_time = pub_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-                        except:
-                            age_min = 9999
-                        results.append({"title": title, "age_min": age_min, "time": pub_time})
-            except Exception as e:
-                log.warning(f"⚠️ CryptoPanic API fetch failed: {e}")
-
-        # 2. Add free public RSS and Atom feeds (aggregates from CoinTelegraph, CoinDesk, Decrypt, Blockworks)
-        import xml.etree.ElementTree as ET
-        feeds = [
-            "https://cointelegraph.com/rss",
-            "https://www.coindesk.com/arc/outboundfeeds/rss/",
-            "https://decrypt.co/feed",
-            "https://blockworks.co/feed"
-        ]
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        for url in feeds:
-            try:
-                r = self.session.get(url, headers=headers, timeout=5)
-                if r.status_code != 200:
-                    continue
-                root = ET.fromstring(r.content)
-                
-                # Namespace-agnostic element extraction
-                elements = []
-                for el in root.iter():
-                    tag_local = el.tag.split("}")[-1]
-                    if tag_local in ("item", "entry"):
-                        elements.append(el)
-                        
-                for el in elements[:10]:
-                    title_text = ""
-                    pub_date_text = ""
-                    
-                    for child in el:
-                        child_tag = child.tag.split("}")[-1]
-                        if child_tag == "title":
-                            title_text = child.text.strip() if child.text else ""
-                        elif child_tag in ("pubDate", "published", "updated"):
-                            pub_date_text = child.text.strip() if child.text else ""
-                            
-                    # Filter by currency if specified
-                    if currency and currency.upper() not in title_text.upper():
-                        continue
-                        
-                    age_min = 9999
-                    pub_time = "N/A"
-                    if pub_date_text:
-                        if "T" in pub_date_text:
-                            try:
-                                pub_dt = datetime.strptime(pub_date_text[:19], "%Y-%m-%dT%H:%M:%S")
-                                age_min = int((now - pub_dt).total_seconds() / 60)
-                                pub_time = pub_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-                            except:
-                                pass
-                        else:
-                            try:
-                                dt_str = pub_date_text.replace("GMT", "").replace("UTC", "").split("+")[0].split("-")[0].strip()
-                                pub_dt = datetime.strptime(dt_str, "%a, %d %b %Y %H:%M:%S")
-                                age_min = int((now - pub_dt).total_seconds() / 60)
-                                pub_time = pub_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-                            except:
-                                pass
-                                
-                    if title_text:
-                        results.append({"title": title_text, "age_min": age_min, "time": pub_time})
-            except Exception as e:
-                log.warning(f"⚠️ Failed to parse RSS feed {url}: {e}")
-                
+        # Append only pushed news items from the local cache
+        with self.pushed_news_lock:
+            valid_pushed = []
+            for item in self.pushed_news:
+                pub_dt = item.get("pub_dt")
+                if pub_dt:
+                    age_min = int((now - pub_dt).total_seconds() / 60)
+                    if age_min < 1440:  # Keep news from last 24 hours
+                        if currency and currency.upper() not in item["title"].upper():
+                            continue
+                        results.append({
+                            "title": item["title"],
+                            "age_min": age_min,
+                            "time": pub_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                        })
+                        valid_pushed.append(item)
+            self.pushed_news = valid_pushed
+        
         # Sort by age_min so that the latest news is always at the top
         results = sorted(results, key=lambda x: x["age_min"])
         
-        # Log success and the latest items to console
         if results:
-            log.info(f"📰 Successfully fetched {len(results)} news items. Latest articles:")
+            log.info(f"📰 Successfully fetched {len(results)} news items from pushed queue. Latest articles:")
             for item in results[:3]:
                 log.info(f"   • [{item['time']} / {item['age_min']}m ago] {item['title']}")
         else:
-            log.warning("⚠️ No news items could be fetched from any feeds.")
+            log.warning("⚠️ No pushed news items currently queued.")
             
         return results[:15]
 
@@ -2266,6 +2265,7 @@ DASHBOARD_HTML = """
                 <div class="tab-buttons">
                     <button class="tab-btn active" onclick="switchTab('left-panel', 'tab-schedule', this)">Schedule Timeline</button>
                     <button class="tab-btn" onclick="switchTab('left-panel', 'tab-posts', this)">Recent Published Posts</button>
+                    <button class="tab-btn" onclick="switchTab('left-panel', 'tab-news-queue', this)">Pushed News Queue</button>
                 </div>
 
                 <div class="tab-content active" id="tab-schedule">
@@ -2277,6 +2277,12 @@ DASHBOARD_HTML = """
                 <div class="tab-content" id="tab-posts">
                     <div class="posts-container" id="posts-list">
                         <div style="color: var(--text-secondary); text-align: center; padding: 2rem;">No posts published yet.</div>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="tab-news-queue">
+                    <div class="posts-container" id="news-queue-list">
+                        <div style="color: var(--text-secondary); text-align: center; padding: 2rem;">No news items currently queued.</div>
                     </div>
                 </div>
             </div>
@@ -2305,13 +2311,11 @@ DASHBOARD_HTML = """
             }
             btnEl.classList.add('active');
             
-            if (tabId === 'tab-schedule') {
-                document.getElementById('tab-schedule').classList.add('active');
-                document.getElementById('tab-posts').classList.remove('active');
-            } else {
-                document.getElementById('tab-schedule').classList.remove('active');
-                document.getElementById('tab-posts').classList.add('active');
-            }
+            document.getElementById('tab-schedule').classList.remove('active');
+            document.getElementById('tab-posts').classList.remove('active');
+            document.getElementById('tab-news-queue').classList.remove('active');
+            
+            document.getElementById(tabId).classList.add('active');
         }
         
         function formatUptime(diffSeconds) {
@@ -2516,6 +2520,26 @@ DASHBOARD_HTML = """
                     postsContainer.innerHTML = '<div style="color: var(--text-secondary); text-align: center; padding: 2rem;">No posts published yet.</div>';
                 }
                 
+                const newsContainer = document.getElementById('news-queue-list');
+                if (state.pushed_news_queue && state.pushed_news_queue.length > 0) {
+                    let html = '';
+                    state.pushed_news_queue.forEach(item => {
+                        const itemTime = item.published ? new Date(item.published).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Pending';
+                        html += `
+                            <div class="post-card">
+                                <div class="post-header">
+                                    <span>Source: ${item.source}</span>
+                                    <span>Time: ${itemTime}</span>
+                                </div>
+                                <div class="post-content" style="font-weight: 600;">${item.title}</div>
+                            </div>
+                        `;
+                    });
+                    newsContainer.innerHTML = html;
+                } else {
+                    newsContainer.innerHTML = '<div style="color: var(--text-secondary); text-align: center; padding: 2rem;">No news items currently queued.</div>';
+                }
+                
                 const logsContainer = document.getElementById('console-logs-window');
                 if (state.logs && state.logs.length > 0) {
                     let logHtml = '';
@@ -2571,7 +2595,19 @@ def health():
 @app.route("/api/status", methods=["GET"])
 def api_status():
     with state_lock:
-        return jsonify(bot_state)
+        state = dict(bot_state)
+    news_list = []
+    if global_pipeline:
+        with global_pipeline.pushed_news_lock:
+            for item in global_pipeline.pushed_news:
+                pub_dt = item.get("pub_dt")
+                news_list.append({
+                    "title": item.get("title", ""),
+                    "source": item.get("source", "Unknown"),
+                    "published": pub_dt.isoformat() if pub_dt else None
+                })
+    state["pushed_news_queue"] = news_list
+    return jsonify(state)
 
 @app.route("/api/post-now", methods=["POST"])
 def post_now():
@@ -2587,6 +2623,420 @@ def post_now():
             "status": "error",
             "message": str(e)
         }), 500
+
+
+def clean_source_name(src: str) -> str:
+    if not src:
+        return "Unknown"
+    src = src.strip()
+    # Handle social media URLs
+    if src.startswith("http://") or src.startswith("https://"):
+        parts = src.replace("https://", "").replace("http://", "").split("/")
+        if len(parts) > 1 and ("twitter.com" in parts[0] or "x.com" in parts[0]):
+            return parts[1].split("?")[0].strip()
+            
+    # Clean standard domain suffixes and prefixes
+    src = src.replace("https://", "").replace("http://", "")
+    src = src.split("/")[0]
+    for suffix in (".com", ".org", ".net", ".co", ".io", ".xyz", ".info"):
+        if src.lower().endswith(suffix):
+            src = src[:-len(suffix)]
+    src = src.replace("@", "")
+    return src.strip()
+
+NEWS_SYSTEM_PROMPT = """You are an AI assistant that formats cryptocurrency news posts and searches the web for a relevant, publicly accessible image URL to accompany the news.
+Your task is to:
+1. Generate the post body text. The post body text MUST consist of the news title followed by the news source. You are allowed to make minor corrections to the title to fix grammatical mistakes or writing/spelling errors if necessary, but keep the overall content and meaning the same.
+2. You MUST add relevant coin tags (e.g., $BTC, $ETH, $SOL) at the end of the post if there are no coin tags or coin names mentioned in the title/content. If the title does not mention a coin tag, identify the main coin associated with the news and add its tag (e.g. $BTC).
+3. You MUST add exactly 1 to 2 relevant hashtags (e.g., #Bitcoin, #Crypto) at the end of the post.
+4. Search the web for a direct, hotlinkable image URL (ending in .png, .jpg, .jpeg, or .webp) that is highly relevant to the news article.
+5. The image URL must be a real, direct URL. Do NOT return html pages, and do NOT return local/relative URLs. If no high-quality, direct image URL can be found, return empty string for 'image_url'.
+
+Output your response ONLY as a JSON block wrapped in ```json ... ```:
+{
+  "content": "The news title (with minor grammar corrections if needed)\\n\\nSource: CleanSourceName\\n\\n#hashtags $COINS",
+  "image_url": "The direct image URL"
+}"""
+
+def generate_news_post(client: genai.Client, title: str, source: str) -> tuple[str, str]:
+    prompt = f"News Title: {title}\nNews Source: {source}\n\nFormat this news post and find a relevant image URL using Google Search."
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=NEWS_SYSTEM_PROMPT,
+                tools=[{"google_search": {}}],
+                temperature=0.2,
+            )
+        )
+        text = resp.text.strip()
+        # Parse JSON from model response
+        match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if match:
+            res = json.loads(match.group(1).strip())
+        else:
+            match_braces = re.search(r"(\{.*\})", text, re.DOTALL)
+            if match_braces:
+                res = json.loads(match_braces.group(1).strip())
+            else:
+                raise ValueError("No JSON block found in model response")
+        return res["content"], res.get("image_url", "")
+    except Exception as e:
+        log.warning(f"Failed to generate news post via Gemini: {e}. Falling back to manual formatting.")
+        content = f"{title}\n\nSource: {source}"
+        return content, ""
+
+def news_scheduler_worker(items: list, start_time: datetime):
+    global last_posted_news_time
+    n_items = len(items)
+    if n_items == 0:
+        return
+        
+    log.info(f"📅 Starting news scheduler thread for {n_items} items over the next 25 minutes.")
+    
+    total_seconds = 25 * 60
+    if n_items == 1:
+        interval_sec = 0
+    else:
+        interval_sec = total_seconds / (n_items - 1)
+        
+    for i, item in enumerate(items):
+        target_time = start_time + timedelta(seconds=i * interval_sec)
+        
+        while True:
+            if news_cancel_event.is_set():
+                log.info("🚫 News scheduler thread cancelled.")
+                return
+                
+            now = datetime.utcnow()
+            wait = (target_time - now).total_seconds()
+            if wait <= 0:
+                break
+            time.sleep(min(1, wait))
+            
+        log.info(f"📰 News Scheduler: Posting item {i+1}/{n_items}: '{item['title']}'")
+        try:
+            title = item.get("title", "")
+            if item.get("final_content"):
+                post_content = item["final_content"]
+                image_url = item.get("image_url", "")
+                log.info("  ✨ Using pre-generated news content and image URL from intake evaluation.")
+            else:
+                raw_source = item.get("source", "Unknown")
+                clean_src = clean_source_name(raw_source)
+                post_content, image_url = generate_news_post(global_rotator.get_client(), title, clean_src)
+            
+            image_urls = []
+            image_uploaded = False
+            
+            if image_url:
+                log.info(f"  📥 Attempting to download Gemini recommended image from: {image_url}")
+                try:
+                    r = requests.get(image_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                    if r.status_code == 200:
+                        cdn = global_uploader.upload(r.content)
+                        if cdn:
+                            image_urls.append(cdn)
+                            image_uploaded = True
+                            log.info(f"  ✅ Successfully uploaded Gemini recommended image: {cdn}")
+                except Exception as e:
+                    log.warning(f"  ⚠️ Failed to download/upload Gemini image: {e}")
+            
+            # Fallback to local TA chart generation if Gemini image wasn't successfully uploaded
+            if not image_uploaded:
+                mentioned_coin = None
+                for coin in COINS:
+                    if (coin["tag"].lower() in title.lower() or 
+                        coin["cp"].lower() in title.lower() or 
+                        coin["cg_id"].lower() in title.lower()):
+                        mentioned_coin = coin
+                        break
+                
+                if not mentioned_coin:
+                    mentioned_coin = next((c for c in COINS if c["tag"] == "$BTC"), None)
+                    
+                if mentioned_coin:
+                    log.info(f"  📈 Fallback: Generating TA chart for {mentioned_coin['tag']}...")
+                    analysis = global_pipeline.analyse_coin(mentioned_coin)
+                    if analysis:
+                        chart_bytes = global_charts.generate(analysis)
+                        if chart_bytes:
+                            cdn = global_uploader.upload(chart_bytes)
+                            if cdn:
+                                image_urls.append(cdn)
+                                
+            log.info(f"📤 Publishing news post: {post_content[:60]}... {'with image' if image_urls else 'text-only'}")
+            result_pub = publish(post_content, image_urls or None)
+            code = result_pub.get("code", "")
+            
+            if code == "000000":
+                post_id = result_pub.get("data", {}).get("id", "unknown")
+                url = f"https://www.binance.com/square/post/{post_id}"
+                log.info(f"  ✅ News Post Success → {url}")
+                
+                pub_dt = item.get("pub_dt")
+                if pub_dt:
+                    last_posted_news_time = pub_dt
+                
+                # Deduplication: record the cleaned title to prevent posting it again
+                clean_title = item.get("title", "").strip().lower()
+                if clean_title and clean_title not in posted_news_titles:
+                    posted_news_titles.append(clean_title)
+                    if len(posted_news_titles) > 500:
+                        posted_news_titles.pop(0)
+                save_news_state(last_posted_news_time, posted_news_titles)
+                    
+                with state_lock:
+                    bot_state["posts_published"] += 1
+                    bot_state["recent_posts"].append({
+                        "time": datetime.utcnow().isoformat() + "Z",
+                        "content": post_content,
+                        "status": "Success",
+                        "url": url
+                    })
+                    if len(bot_state["recent_posts"]) > 20:
+                        bot_state["recent_posts"].pop(0)
+            else:
+                msg = result_pub.get("message", "Unknown error")
+                log.error(f"  ❌ News Publish Failed: {msg} (code={code})")
+                
+        except Exception as e:
+            log.exception(f"Error in news scheduler posting item: {e}")
+
+
+def evaluate_and_clean_news_batch(news_items: list[dict]) -> list[dict]:
+    if not news_items:
+        return []
+        
+    global global_rotator
+    if not global_rotator:
+        log.warning("Gemini rotator not initialized. Skipping evaluation.")
+        for item in news_items:
+            item["importance"] = 1
+            item["final_content"] = ""
+            item["image_url"] = ""
+        return news_items
+        
+    # Prepare input list
+    input_data = []
+    for idx, item in enumerate(news_items):
+        input_data.append({
+            "id": idx,
+            "title": item.get("title", ""),
+            "source": item.get("source", "")
+        })
+        
+    prompt = f"""You are a cryptocurrency news analyst and content writer.
+Your tasks are:
+1. For each news article, assess its market importance for crypto traders on a scale of 1 to 30 (30 = critical market-moving event, 1 = low-value noise/unimportant).
+   Determine importance based on:
+   - Coin Name / Tag: Does it have a coin name mentioned? (This is the highest priority). You must identify the coin associated with the news. If a news item does not mention any cryptocurrency/coin and you cannot identify a relevant coin to tag it with, reject the news item by setting its importance to 0.
+   - Actionability: Will someone decide to buy or sell the coin based on this news?
+   - Price Fluctuation: Will the price of the coin fluctuate because of this news? The more the price is expected to change/fluctuate, the higher the importance score.
+2. Identify the top 2 most important news items (importance > 0). If there is a tie, select the ones that are most market-moving.
+3. For these top 2 news items only:
+   - Search the web using the Google Search tool for a direct, hotlinkable image URL (ending in .png, .jpg, .jpeg, or .webp) that is highly relevant to the news article.
+   - Correct any spelling, grammatical, or writing errors in the title.
+   - Generate the final post body text ('final_content') consisting of the news title followed by the news source.
+   - You MUST add relevant coin tags (e.g. $BTC, $ETH, $SOL) at the end of the content if they are not already in the title/content. If the title does not mention a coin tag, identify the main coin associated with the news and add its tag (e.g. $BTC).
+   - You MUST add exactly 1 to 2 relevant hashtags (e.g. #Bitcoin, #Crypto) at the end of the content.
+   - Format: "News Title\\n\\nSource: CleanSourceName\\n\\n#hashtags $COINS" (Clean the source name by removing suffixes like .com, @ prefix, etc.).
+
+Return the processed articles in JSON format as a list of objects.
+
+Input news items:
+{json.dumps(input_data, indent=2)}
+
+Output JSON block wrapped in ```json ... ```:
+[
+  {{
+    "id": 0,
+    "title": "Cleaned corrected title",
+    "importance": 25,
+    "final_content": "Cleaned corrected title\\n\\nSource: CleanSourceName\\n\\n#hashtags $COINS",
+    "image_url": "https://example.com/image.jpg"
+  }},
+  ...
+]"""
+
+    # Call Gemini
+    last_err = None
+    for _ in range(len(global_rotator.clients)):
+        try:
+            client = global_rotator.get_client()
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    tools=[{"google_search": {}}],
+                    temperature=0.2,
+                )
+            )
+            text = response.text
+            
+            # Extract JSON block
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            else:
+                text = text.strip()
+                
+            results = json.loads(text)
+            
+            # Map back to original items
+            evaluated_items = []
+            for res in results:
+                original_idx = res.get("id")
+                if original_idx is not None and 0 <= original_idx < len(news_items):
+                    orig = news_items[original_idx]
+                    cleaned_item = dict(orig)
+                    cleaned_item["title"] = res.get("title", orig.get("title"))
+                    cleaned_item["importance"] = int(res.get("importance", 1))
+                    cleaned_item["final_content"] = res.get("final_content", "")
+                    cleaned_item["image_url"] = res.get("image_url", "")
+                    evaluated_items.append(cleaned_item)
+            return evaluated_items
+            
+        except Exception as e:
+            log.error(f"❌ Gemini news batch evaluation failed on key index {global_rotator.current_idx}: {e}")
+            last_err = e
+            global_rotator.rotate()
+            
+    log.warning(f"⚠️ Failed to evaluate news batch via Gemini: {last_err}. Using original items with default importance.")
+    for item in news_items:
+        item["importance"] = 1
+        item["final_content"] = ""
+        item["image_url"] = ""
+    return news_items
+
+
+@app.route("/api/news", methods=["POST"])
+def receive_news():
+    global last_posted_news_time, news_schedule_thread, news_cancel_event
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"status": "error", "message": "Invalid JSON format"}), 400
+        
+    if global_pipeline is None:
+        return jsonify({"status": "error", "message": "Data pipeline is not initialized yet"}), 503
+        
+    items = data if isinstance(data, list) else [data]
+    
+    # 1. Filter only those news that came after the last news that was posted and not already published
+    unprocessed_new_items = []
+    for item in items:
+        title = item.get("title")
+        if not title:
+            continue
+            
+        clean_t = title.strip().lower()
+        if clean_t in posted_news_titles:
+            continue
+            
+        published = item.get("published")
+        pub_dt = parse_scraped_date(published)
+        
+        # Check against last_posted_news_time
+        if last_posted_news_time is not None:
+            if pub_dt <= last_posted_news_time:
+                continue
+        # Temporarily store pub_dt
+        item_with_dt = dict(item)
+        item_with_dt["_pub_dt"] = pub_dt
+        unprocessed_new_items.append(item_with_dt)
+        
+    if not unprocessed_new_items:
+        log.info(f"Received {len(items)} news items, but all of them are duplicates or older than the last posted news.")
+        return jsonify({
+            "status": "success",
+            "message": "No new news items to schedule (all duplicates or older items)."
+        })
+        
+    # Evaluate importance and fix minor writing/grammar mistakes using Gemini
+    log.info(f"Analyzing and cleaning {len(unprocessed_new_items)} new news items via Gemini...")
+    evaluated_items = evaluate_and_clean_news_batch(unprocessed_new_items)
+    
+    # Associate parsed pub_dt back to evaluated items
+    for item, orig in zip(evaluated_items, unprocessed_new_items):
+        item["pub_dt"] = orig["_pub_dt"]
+        
+    # Filter out items where importance is 0 (rejected by Gemini)
+    evaluated_items = [item for item in evaluated_items if item.get("importance", 0) > 0]
+    
+    if not evaluated_items:
+        log.info("All new news items were rejected because they did not mention or have relevance to any specific coin/cryptocurrency.")
+        return jsonify({
+            "status": "success",
+            "message": "All news items were rejected (no coin mentions or relevance)."
+        })
+        
+    # Sort items by importance descending (highest first) and then by pub_dt descending (most recent first)
+    evaluated_items.sort(key=lambda x: (x.get("importance", 1), x["pub_dt"]), reverse=True)
+    
+    # 2. Count news posts published in the last 24 hours to enforce the rolling limit of 80
+    now = datetime.utcnow()
+    last_24h_posts = 0
+    with state_lock:
+        for post in bot_state.get("recent_posts", []):
+            try:
+                post_dt = datetime.fromisoformat(post["time"].replace("Z", ""))
+                if (now - post_dt).total_seconds() < 86400:
+                    last_24h_posts += 1
+            except Exception as e:
+                pass
+                
+    remaining_budget = max(0, 80 - last_24h_posts)
+    if remaining_budget == 0:
+        log.warning("⚠️ Daily limit of 80 news posts reached. Skipping scheduling for this batch.")
+        return jsonify({
+            "status": "success",
+            "message": "Daily limit of 80 news posts reached. Pushed news skipped."
+        })
+        
+    # Select the most important & recent ones, capping at min(remaining_budget, 2)
+    max_to_schedule = min(remaining_budget, 2)
+    selected_items = evaluated_items[:max_to_schedule]
+    
+    # Log the selection
+    log.info(f"Selected {len(selected_items)} most important/recent news items to schedule (out of {len(evaluated_items)} candidates). remaining_budget={remaining_budget}")
+    for idx, item in enumerate(selected_items):
+        log.info(f"  [{idx+1}] Importance: {item.get('importance', 1)} | Title: {item.get('title')}")
+        
+    # 3. Before storing, clear the previous news and keep only the selected ones
+    with global_pipeline.pushed_news_lock:
+        global_pipeline.pushed_news.clear()
+        for item in selected_items:
+            global_pipeline.pushed_news.append(item)
+            
+    # 4. Schedule the selected news for next 25 mins
+    with news_lock:
+        # Cancel current running news scheduler thread if any
+        if news_schedule_thread and news_schedule_thread.is_alive():
+            news_cancel_event.set()
+            news_schedule_thread.join(timeout=2)
+        news_cancel_event.clear()
+        
+        # Prepare copies without internal prefix keys for scheduler worker
+        worker_items = []
+        for item in selected_items:
+            item_copy = dict(item)
+            if "_pub_dt" in item_copy:
+                del item_copy["_pub_dt"]
+            worker_items.append(item_copy)
+            
+        news_schedule_thread = threading.Thread(
+            target=news_scheduler_worker,
+            args=(worker_items, datetime.utcnow()),
+            daemon=True
+        )
+        news_schedule_thread.start()
+        
+    return jsonify({
+        "status": "success",
+        "message": f"Successfully evaluated {len(evaluated_items)} items. Scheduled the top {len(selected_items)} most important/recent news items for the next 25 minutes."
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
