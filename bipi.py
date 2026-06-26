@@ -2834,8 +2834,8 @@ Your tasks are:
    - Coin Name / Tag: Does it have a coin name mentioned? (This is the highest priority). You must identify the coin associated with the news. If a news item does not mention any cryptocurrency/coin and you cannot identify a relevant coin to tag it with, reject the news item by setting its importance to 0.
    - Actionability: Will someone decide to buy or sell the coin based on this news?
    - Price Fluctuation: Will the price of the coin fluctuate because of this news? The more the price is expected to change/fluctuate, the higher the importance score.
-2. Identify the top 2 most important news items (importance > 0). If there is a tie, select the ones that are most market-moving.
-3. For these top 2 news items only:
+2. Identify the top 4 most important news items (importance > 0). If there is a tie, select the ones that are most market-moving.
+3. For these top 4 news items only:
    - Search the web using the Google Search tool for a direct, hotlinkable image URL (ending in .png, .jpg, .jpeg, or .webp) that is highly relevant to the news article.
    - Correct any spelling, grammatical, or writing errors in the title.
    - Generate the final post body text ('final_content') consisting of the news title followed by the news source.
